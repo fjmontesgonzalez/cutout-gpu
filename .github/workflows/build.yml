@@ -1,0 +1,54 @@
+# Construye la imagen, la prueba en CPU y la publica en GHCR (ghcr.io/<owner>/cutout-gpu).
+# En el repo de build vive en .github/workflows/build.yml.
+name: build-image
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: build-image
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/cutout-gpu
+    steps:
+      - name: Liberar disco
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost \
+            /opt/hostedtoolcache/go /opt/hostedtoolcache/PyPy || true
+          docker system prune -af || true
+          df -h /
+      - uses: actions/checkout@v4
+      - name: Construir imagen
+        run: |
+          docker build --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            -t cutout:ci .
+          docker images cutout:ci
+      - name: Tests de la lógica de máscara
+        run: docker run --rm -v "$PWD:/w" cutout:ci python /w/test_postproc.py
+      - name: Prueba de humo en CPU
+        run: |
+          TOKEN=ci-smoke-token
+          HASH=$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)
+          docker run -d --name cut -p 9000:9000 -e CUTOUT_TOKEN_SHA256="$HASH" -e CUTOUT_ALLOW_DEBUG=1 cutout:ci
+          docker run --rm --network host -v "$PWD:/w" cutout:ci python /w/smoke_test.py http://127.0.0.1:9000 "$TOKEN"
+      - name: Logs del servidor
+        if: always()
+        run: docker logs cut 2>&1 | tail -120 || true
+      - name: Publicar en GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          TAG=$(echo "$GITHUB_SHA" | cut -c1-12)
+          docker tag cutout:ci "$IMAGE:$TAG"
+          docker tag cutout:ci "$IMAGE:latest"
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+          echo "Imagen publicada: $IMAGE:$TAG" >> "$GITHUB_STEP_SUMMARY"

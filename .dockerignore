@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!requirements.txt
+!download_models.py
+!postproc.py
+!server.py
