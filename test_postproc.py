@@ -153,6 +153,65 @@ def test_merge_rejects_without_gain():
     assert merged is None and info["reject"] == "no_gain", info
 
 
+ILLU = (250, 650, 650, 1000)   # ilustración impresa dentro del libro (las dos mujeres)
+
+
+def test_undersegmented_detects_print_only_mask():
+    a = rect(ILLU)
+    det = pp.Detection(0.62, tuple(float(v) for v in BOOK), "book")
+    got, info = pp.undersegmented_box(a, [det])
+    assert got is det, info
+
+
+def test_undersegmented_ignores_whole_book_and_low_score():
+    det = pp.Detection(0.62, tuple(float(v) for v in BOOK), "book")
+    got, info = pp.undersegmented_box(rect(BOOK), [det])
+    assert got is None, info
+    low = pp.Detection(0.30, tuple(float(v) for v in BOOK), "book")
+    got, info = pp.undersegmented_box(rect(ILLU), [low])
+    assert got is None, info
+
+
+def test_undersegmented_ignores_mask_outside_box():
+    a = rect(ILLU)
+    a[100:300, 760:880] = 255              # medio producto fuera de la caja: no es "lo impreso"
+    a[1050:1190, 0:880] = 255
+    det = pp.Detection(0.62, tuple(float(v) for v in BOOK), "book")
+    got, info = pp.undersegmented_box(a, [det])
+    assert got is None, info
+
+
+def test_box_rescue_fills_whole_book():
+    a = rect(ILLU)
+    sam = rect(BOOK) > 0
+    merged, info = pp.merge_box_rescue(a, sam, tuple(float(v) for v in BOOK))
+    assert merged is not None, info
+    assert merged[300, 300] == 255 and merged[1040, 700] == 255     # todo el libro
+    assert merged[100, 100] == 0 and merged[1150, 850] == 0         # fuera, transparente
+
+
+def test_box_rescue_rejects_non_convex_sam():
+    a = rect(ILLU)
+    sam = rect(BOOK) > 0
+    sam[150:600, 450:750] = False
+    merged, info = pp.merge_box_rescue(a, sam, tuple(float(v) for v in BOOK))
+    assert merged is None and info["reject"] == "sam_not_convex", info
+
+
+def test_box_rescue_rejects_sam_not_filling_box():
+    a = rect(ILLU)
+    sam = rect((150, 150, 750, 500)) > 0   # SAM sólo vio la franja del título
+    merged, info = pp.merge_box_rescue(a, sam, tuple(float(v) for v in BOOK))
+    assert merged is None and info["reject"] == "sam_not_filling_box", info
+
+
+def test_box_rescue_rejects_sam_missing_mask():
+    a = rect((160, 160, 300, 1040))        # BiRefNet vio una franja a la izquierda
+    sam = rect((330, 150, 750, 1050)) > 0  # SAM ve otro rectángulo que no la contiene
+    merged, info = pp.merge_box_rescue(a, sam, (330.0, 150.0, 750.0, 1050.0))
+    assert merged is None and info["reject"] == "sam_misses_mask", info
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

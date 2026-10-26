@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import io
+import json
 import logging
 import os
 import sys
@@ -54,7 +55,42 @@ def _env_float(name: str, default: float) -> float:
 
 MODELS_DIR = os.environ.get("MODELS_DIR", "/models")
 BIREFNET_MAX_SIDE = int(_env_float("BIREFNET_MAX_SIDE", 1536))
-DINO_PROMPT = os.environ.get("DINO_PROMPT", "book. clothing.")
+# Categorías de producto: una por petición (campo `category`) o por defecto
+# (CUTOUT_CATEGORY). Cada una lleva su prompt del detector y sus parámetros; cualquiera se
+# puede cambiar o añadir sin tocar código con CUTOUT_CATEGORIES (JSON), p.ej.
+#   {"shoe": {"prompt": "shoe. sneaker.", "flat": false},
+#    "book": {"dino_threshold": 0.35}}
+# Claves: prompt, flat (rescates con SAM para caras planas: sólo libros), clip (quitar lo
+# que quede fuera de la caja del producto), dino_threshold, clip_min_coverage,
+# clip_min_score, rescue_deficit, sam_max_deficit, max_side (resolución de BiRefNet).
+# Un prompt por categoría: mezclarlos hace que "clothing" encuentre la ropa dibujada en
+# la portada de un libro (medido el 2026-10-26 en "Hindi-Bindi": la caja fue el sari).
+DEFAULT_CATEGORIES: Dict[str, Dict[str, object]] = {
+    "book": {"prompt": "book.", "flat": True},
+    "bag": {"prompt": "bag. handbag. purse.", "flat": False},
+    "backpack": {"prompt": "backpack. bag.", "flat": False},
+    "clothing": {"prompt": "clothing. garment.", "flat": False},
+}
+
+
+def _load_categories() -> Dict[str, Dict[str, object]]:
+    cats = {k: dict(v) for k, v in DEFAULT_CATEGORIES.items()}
+    raw = (os.environ.get("CUTOUT_CATEGORIES") or "").strip()
+    if raw:
+        try:
+            extra = json.loads(raw)
+            for name, conf in extra.items():
+                key = str(name).strip().lower()
+                merged = dict(cats.get(key, {"prompt": key + ".", "flat": False}))
+                merged.update(conf or {})
+                cats[key] = merged
+        except Exception as exc:  # noqa: BLE001
+            log.error("CUTOUT_CATEGORIES no es un JSON válido (%s); se usan las categorías por defecto", exc)
+    return cats
+
+
+CATEGORIES = _load_categories()
+DEFAULT_CATEGORY = (os.environ.get("CUTOUT_CATEGORY", "book") or "book").strip().lower()
 DINO_THRESHOLD = _env_float("DINO_THRESHOLD", 0.30)
 DINO_TEXT_THRESHOLD = _env_float("DINO_TEXT_THRESHOLD", 0.25)
 CLIP_MIN_COVERAGE = _env_float("CLIP_MIN_COVERAGE", 0.85)
@@ -156,11 +192,11 @@ def _warmup() -> None:
 
 
 # --------------------------------------------------------------------------- modelos
-def _birefnet_alpha(rgb: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
+def _birefnet_alpha(rgb: np.ndarray, max_side: int = BIREFNET_MAX_SIDE) -> Tuple[np.ndarray, Tuple[int, int]]:
     torch = _M["torch"]
     import torch.nn.functional as F
     h, w = rgb.shape[:2]
-    tw, th = pp.work_size(w, h, max_side=BIREFNET_MAX_SIDE)
+    tw, th = pp.work_size(w, h, max_side=max_side)
     small = np.array(Image.fromarray(rgb).resize((tw, th), Image.Resampling.BICUBIC))
     x = torch.from_numpy(small).to(_M["device"]).permute(2, 0, 1).float().div_(255.0)
     x = ((x - _M["mean"]) / _M["std"]).unsqueeze(0)
@@ -173,11 +209,24 @@ def _birefnet_alpha(rgb: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
     return alpha, (tw, th)
 
 
-def _dino(rgb: np.ndarray) -> List[pp.Detection]:
+def _category(raw: Optional[str]) -> str:
+    value = (raw or "").strip().lower()
+    return value if value in CATEGORIES else (
+        DEFAULT_CATEGORY if DEFAULT_CATEGORY in CATEGORIES else "book")
+
+
+def _param(conf: Dict[str, object], key: str, default: float) -> float:
+    try:
+        return float(conf.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _dino(rgb: np.ndarray, prompt: str) -> List[pp.Detection]:
     torch = _M["torch"]
     h, w = rgb.shape[:2]
     proc = _M["dino_proc"]
-    inputs = proc(images=Image.fromarray(rgb), text=DINO_PROMPT, return_tensors="pt").to(_M["device"])
+    inputs = proc(images=Image.fromarray(rgb), text=prompt, return_tensors="pt").to(_M["device"])
     with torch.inference_mode():
         out = _M["dino"](**inputs)
     kwargs = dict(text_threshold=DINO_TEXT_THRESHOLD, target_sizes=[(h, w)])
@@ -215,35 +264,69 @@ def _sam(rgb: np.ndarray, box: pp.Box) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- pipeline
-def _process(rgb: np.ndarray, *, kind: Optional[str] = None,
+def _process(rgb: np.ndarray, *, kind: Optional[str] = None, category: Optional[str] = None,
              force_rescue: bool = False) -> Tuple[np.ndarray, Dict[str, object]]:
     info: Dict[str, object] = {}
+    cat = _category(category)
+    conf = CATEGORIES[cat]
+    info["category"] = cat
+    dino_threshold = _param(conf, "dino_threshold", DINO_THRESHOLD)
+    clip_min_score = _param(conf, "clip_min_score", CLIP_MIN_SCORE)
     t = time.time()
-    alpha, work = _birefnet_alpha(rgb)
+    alpha, work = _birefnet_alpha(rgb, int(_param(conf, "max_side", BIREFNET_MAX_SIDE)))
     info["work"] = "{}x{}".format(*work)
     info["t_birefnet"] = round(time.time() - t, 3)
 
     t = time.time()
-    dets = _dino(rgb)
-    plan = pp.choose_boxes(alpha, dets, min_score=DINO_THRESHOLD)
+    dets = _dino(rgb, str(conf.get("prompt") or cat + "."))
+    plan = pp.choose_boxes(alpha, dets, min_score=dino_threshold)
     info["t_dino"] = round(time.time() - t, 3)
     if plan.main is not None:
         b = plan.main.box
         info["box"] = "{:.0f},{:.0f},{:.0f},{:.0f}@{:.2f}".format(b[0], b[1], b[2], b[3], plan.main.score)
-    alpha, clip = pp.clip_outside(alpha, plan, min_coverage=CLIP_MIN_COVERAGE, min_main_score=CLIP_MIN_SCORE)
-    info["clip"] = "removed={}".format(clip["removed"]) if clip.get("clipped") else str(clip.get("reason"))
+    if conf.get("clip", True):
+        alpha, clip = pp.clip_outside(alpha, plan, min_coverage=_param(conf, "clip_min_coverage", CLIP_MIN_COVERAGE),
+                                      min_main_score=clip_min_score)
+        info["clip"] = "removed={}".format(clip["removed"]) if clip.get("clipped") else str(clip.get("reason"))
+    else:
+        info["clip"] = "disabled"
 
-    need, rinfo = pp.needs_rescue(alpha, kind=kind, deficit_trigger=RESCUE_DEFICIT)
+    info["under"] = "none"
+    info["rescue"] = "none"
+    if not conf.get("flat", False):
+        rinfo = {"deficit": pp.hull_deficit(alpha), "components": len(pp.significant_components(alpha))}
+        info["deficit_initial"] = rinfo["deficit"]
+        info["components_initial"] = rinfo["components"]
+        info["deficit_final"] = rinfo["deficit"]
+        info["components_final"] = rinfo["components"]
+        return alpha, info
+
+    # Libro: la máscara cubre sólo una parte de la caja segura del libro => BiRefNet
+    # recortó lo impreso (ilustración, título). SAM con la caja recupera el libro entero.
+    sam_max_deficit = _param(conf, "sam_max_deficit", SAM_MAX_DEFICIT)
+    under, uinfo = pp.undersegmented_box(alpha, dets, min_score=clip_min_score)
+    if under is not None:
+        t = time.time()
+        h, w = alpha.shape
+        merged, minfo = pp.merge_box_rescue(alpha, _sam(rgb, pp.expand_box(under.box, 0.03, w, h, 4.0)),
+                                            under.box, sam_max_deficit=sam_max_deficit)
+        info["t_under"] = round(time.time() - t, 3)
+        if merged is not None:
+            alpha = merged
+            info["under"] = "sam:fill={}".format(uinfo.get("fill"))
+        else:
+            info["under"] = "rejected:{}".format(minfo.get("reject"))
+
+    need, rinfo = pp.needs_rescue(alpha, kind=kind, deficit_trigger=_param(conf, "rescue_deficit", RESCUE_DEFICIT))
     info["deficit_initial"] = rinfo["deficit"]
     info["components_initial"] = rinfo["components"]
-    info["rescue"] = "none"
     if need or force_rescue:
         t = time.time()
         box = pp.rescue_box(alpha, plan.main)
         if box is None:
             info["rescue"] = "no_box"
         else:
-            merged, minfo = pp.merge_rescue(alpha, _sam(rgb, box), box, sam_max_deficit=SAM_MAX_DEFICIT)
+            merged, minfo = pp.merge_rescue(alpha, _sam(rgb, box), box, sam_max_deficit=sam_max_deficit)
             if merged is not None:
                 alpha = merged
                 info["rescue"] = "sam"
@@ -296,7 +379,14 @@ def root():
     return health()
 
 
-def _cutout(file_bytes: bytes, kind: Optional[str], force_rescue: bool) -> Response:
+@app.get("/categories")
+def categories():
+    """Categorías activas y sus parámetros (sin secretos)."""
+    return {"default": _category(None), "categories": CATEGORIES}
+
+
+def _cutout(file_bytes: bytes, kind: Optional[str], force_rescue: bool,
+            category: Optional[str] = None) -> Response:
     t0 = time.time()
     if not file_bytes:
         return JSONResponse({"error": "empty_file"}, status_code=400)
@@ -313,7 +403,7 @@ def _cutout(file_bytes: bytes, kind: Optional[str], force_rescue: bool) -> Respo
     try:
         load_models()
         with _infer_lock:
-            alpha, info = _process(rgb, kind=kind, force_rescue=force_rescue)
+            alpha, info = _process(rgb, kind=kind, category=category, force_rescue=force_rescue)
         png = _encode_png(rgb, alpha)
     except Exception as exc:  # noqa: BLE001
         log.exception("fallo procesando la foto")
@@ -326,9 +416,10 @@ def _cutout(file_bytes: bytes, kind: Optional[str], force_rescue: bool) -> Respo
 
 @app.post("/")
 def cutout(file: UploadFile = File(...), kind: Optional[str] = Form(None),
-           force_rescue: Optional[str] = Form(None), authorization: Optional[str] = Header(None)):
+           category: Optional[str] = Form(None), force_rescue: Optional[str] = Form(None),
+           authorization: Optional[str] = Header(None)):
     denied = _auth_ok(authorization)
     if denied is not None:
         return denied
     force = ALLOW_DEBUG and (force_rescue or "") == "1"
-    return _cutout(file.file.read(), (kind or "").strip() or None, force)
+    return _cutout(file.file.read(), (kind or "").strip() or None, force, category)

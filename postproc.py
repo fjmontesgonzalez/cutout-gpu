@@ -237,6 +237,90 @@ def needs_rescue(alpha: np.ndarray, *, kind: Optional[str] = None,
     return bool(reasons), info
 
 
+def undersegmented_box(alpha: np.ndarray, detections: Sequence[Detection], *,
+                       min_score: float = 0.35, max_fill: float = 0.6,
+                       min_inside: float = 0.9) -> Tuple[Optional[Detection], Dict[str, object]]:
+    """Caja de libro segura que la máscara sólo cubre en parte.
+
+    Es la firma de "recortó lo impreso, no el libro": la máscara (la ilustración, el
+    título) cae casi entera dentro de la caja del libro (inside >= 0,9) pero llena menos
+    del 60 % de ella. Medido el 2026-10-26 en "Hindi-Bindi" (sólo las dos mujeres) y en
+    "Radar afloat" (sólo el aparato), que el core daba por publicables.
+    Se leen las detecciones crudas: el filtro de `choose_boxes` descarta justo estas cajas.
+    """
+    h, w = alpha.shape
+    solid = alpha >= SOLID
+    total = float(solid.sum())
+    if total <= 0:
+        return None, {"reason": "empty_mask"}
+    best = None
+    for det in detections:
+        if det.score < min_score:
+            continue
+        sy, sx = _box_slices(det.box, w, h)
+        sub = solid[sy, sx]
+        if sub.size == 0:
+            continue
+        fill = float(sub.mean())
+        inside = float(sub.sum()) / total
+        if fill < max_fill and inside >= min_inside and (best is None or det.score > best[0].score):
+            best = (det, fill, inside)
+    if best is None:
+        return None, {"reason": "no_candidate"}
+    det, fill, inside = best
+    return det, {"fill": round(fill, 3), "inside": round(inside, 3), "score": round(det.score, 2)}
+
+
+def merge_box_rescue(alpha: np.ndarray, sam_mask: np.ndarray, box: Box, *,
+                     sam_max_deficit: float = 0.03, min_box_fill: float = 0.75,
+                     min_cover: float = 0.9, box_margin: float = 0.03, erode_px: int = 2,
+                     feather_sigma: float = 0.8) -> Tuple[Optional[np.ndarray], Dict[str, object]]:
+    """Sustituye una máscara de "sólo lo impreso" por el libro entero que ve SAM en la caja.
+
+    Aquí la prueba es la caja del detector, no el casco de BiRefNet (que sólo rodea la
+    ilustración). Por eso las tres reglas son estrictas:
+    1. SAM ve una cara plana: déficit <= sam_max_deficit.
+    2. SAM llena la caja del libro (>= min_box_fill): segmentó el objeto que detectó DINO.
+    3. SAM contiene lo que ya vio BiRefNet (>= min_cover): es el mismo producto.
+    Límite conocido: libro crema sobre mesa crema alineado con la caja; SAM podría rellenar
+    la caja con mesa y pasar las tres reglas. Lo para la guarda de material ajeno del core.
+    """
+    h, w = alpha.shape
+    info: Dict[str, object] = {}
+    sam = sam_mask.astype(bool)
+    sy, sx = _box_slices(expand_box(box, box_margin, w, h, 4.0), w, h)
+    inbox = np.zeros_like(sam)
+    inbox[sy, sx] = True
+    sam &= inbox
+    solid = alpha >= SOLID
+    d_sam = hull_deficit(sam.astype(np.uint8) * 255)
+    info["sam_deficit"] = d_sam
+    if d_sam > sam_max_deficit:
+        info["reject"] = "sam_not_convex"
+        return None, info
+    by, bx = _box_slices(box, w, h)
+    box_fill = float(sam[by, bx].mean()) if sam[by, bx].size else 0.0
+    info["sam_box_fill"] = round(box_fill, 3)
+    if box_fill < min_box_fill:
+        info["reject"] = "sam_not_filling_box"
+        return None, info
+    cover = float((sam & solid).sum()) / max(1.0, float(solid.sum()))
+    info["sam_cover"] = round(cover, 3)
+    if cover < min_cover:
+        info["reject"] = "sam_misses_mask"
+        return None, info
+    add = sam
+    if erode_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1, 2 * erode_px + 1))
+        add = cv2.erode(add.astype(np.uint8), k).astype(bool)
+    soft = add.astype(np.float32) * 255.0
+    if feather_sigma > 0:
+        soft = cv2.GaussianBlur(soft, (0, 0), feather_sigma)
+    merged = np.maximum(alpha, np.clip(soft, 0, 255).astype(np.uint8))
+    info["added"] = round(float((merged >= SOLID).sum() - solid.sum()) / max(1.0, float(solid.sum())), 4)
+    return merged, info
+
+
 def rescue_box(alpha: np.ndarray, main: Optional[Detection], *, pad: float = 0.01) -> Optional[Box]:
     """Caja para SAM: la de la máscara (todos los trozos), unida a la del detector si coinciden."""
     h, w = alpha.shape
