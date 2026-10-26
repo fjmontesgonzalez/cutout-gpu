@@ -166,7 +166,8 @@ def _load_birefnet(path: str, device: str, dtype):
     import torch
     try:
         from transformers import AutoModelForImageSegmentation
-        model = AutoModelForImageSegmentation.from_pretrained(path, trust_remote_code=True)
+        model = AutoModelForImageSegmentation.from_pretrained(
+            path, trust_remote_code=True, dtype=dtype if dtype is not None else torch.float32)
         how = "automodel"
     except Exception as exc:  # noqa: BLE001
         log.warning("BiRefNet AutoModel falló (%s: %s); carga manual", type(exc).__name__, exc)
@@ -207,15 +208,13 @@ def _load_sam3(path: str, device: str):
         proc = Sam3Processor.from_pretrained(path, size={"height": SAM3_IMAGE_SIZE, "width": SAM3_IMAGE_SIZE})
     else:
         proc = Sam3Processor.from_pretrained(path)
+    # Carga directa en la precisión final: evita una pasada de conversión sobre 1,7 GB
+    # (medido el 26-10: 123 s de carga total en la T4 con conversión posterior).
+    want_half = device == "cuda" and SAM3_DTYPE != "fp32"
+    kwargs["dtype"] = torch.float16 if want_half else torch.float32
     model = Sam3Model.from_pretrained(path, **kwargs)
     model.to(device).eval()
-    if device != "cuda" or SAM3_DTYPE == "fp32":
-        model.float()
-        dtype = torch.float32
-    else:
-        model.half()
-        dtype = torch.float16
-    return model, proc, dtype
+    return model, proc, (torch.float16 if want_half else torch.float32)
 
 
 def load_models() -> None:
@@ -568,6 +567,13 @@ def _cutout(file_bytes: bytes, *, category: Optional[str], kind: Optional[str], 
             "union_png": _mask_png_b64(pp.union_of(scene.products, (h, w))),
             "hands_png": _mask_png_b64(pp.union_of(scene.hands, (h, w))),
             "supports_png": _mask_png_b64(pp.union_of(scene.supports, (h, w))),
+            # Instancias sueltas (con puntuación): permiten re-evaluar `analyze` fuera del
+            # servidor sin perder los umbrales por papel.
+            "instances": {
+                role: [{"label": inst.label, "score": round(inst.score, 4), "png": _mask_png_b64(inst.mask)}
+                       for inst in insts]
+                for role, insts in (("product", scene.products), ("hand", scene.hands), ("support", scene.supports))
+            },
             "models": {},
         }
         for name, entry in proc["models"].items():

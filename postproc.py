@@ -420,6 +420,14 @@ def analyze(alpha: np.ndarray, rgb: Optional[np.ndarray], scene: Scene, *, flat:
     if not matched:
         return _reject(alpha, "product_mismatch", info)
     union = union_of(matched, (h, w))
+    if flat:
+        # La instancia "book" de SAM 3 deja huecos donde hay figuras impresas (medido en
+        # "Hindi-Bindi": excluía a las dos mujeres y sus manos dibujadas caían "fuera" del
+        # libro => rechazo por mano). Una cara plana no tiene agujeros: se rellenan.
+        filled = fill_holes(union)
+        if filled.sum() > union.sum():
+            info["union_holes_filled"] = round(float(filled.sum() - union.sum()) / max(1.0, float(filled.sum())), 4)
+            union = filled
     union_area = float(union.sum())
 
     # 1) Producto cortado por el encuadre: no tiene arreglo.
