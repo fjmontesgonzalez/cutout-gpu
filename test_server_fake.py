@@ -80,7 +80,8 @@ def fake_scene(rgb, prompts, hazards):
 server._base_alpha = fake_base
 server._sam3_scene = fake_scene
 server._M.update(loaded=True, device="cpu", gpu="cpu", base_default="birefnet",
-                 bases={"birefnet": {"mode": "dynamic"}, "rmbg2": {"mode": "fixed1024"}}, sam3_dtype=None)
+                 bases={"birefnet": {"mode": "dynamic"}, "rmbg2": {"mode": "fixed1024"}},
+                 sam3="fake-sam3", sam3_dtype=None)   # truthy: el servidor usa la escena falsa
 
 client = TestClient(server.app)
 AUTH = {"Authorization": "Bearer tok"}
