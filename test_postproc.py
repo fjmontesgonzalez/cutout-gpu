@@ -157,6 +157,30 @@ def test_printed_hand_on_cover_is_ignored():
     assert r.ok, r.info
 
 
+def test_printed_hand_in_open_bay_of_sam_mask_is_ignored():
+    # Foto 28 (Hindi-Bindi): la máscara "book" de SAM 3 deja una bahía abierta hacia el canto
+    # inferior donde hay figuras impresas; una mano dibujada cae medio dentro. No es oclusión.
+    prod = brect(BOOK)
+    prod[800:1050, 250:420] = False                       # bahía que toca el canto inferior
+    hand = brect((260, 880, 330, 1000)) | brect((330, 880, 450, 940))
+    base = rect(BOOK)
+    r = pp.analyze(base, photo(), scene([inst(prod)], hands=[inst(hand, 0.92, "hand")]), flat=True)
+    assert r.ok, r.info
+
+
+def test_hand_in_bag_handle_gap_still_counts_as_outside():
+    # En bolsos se mide contra la máscara, no contra el casco: una mano en el hueco del asa
+    # sujeta el bolso y la foto se rechaza.
+    bag = brect((200, 500, 700, 900))
+    handle = brect((300, 250, 330, 500)) | brect((570, 250, 600, 500)) | brect((300, 250, 600, 280))
+    prod = bag | handle
+    hand = brect((340, 300, 560, 470))                    # dentro del asa, fuera de la máscara
+    hand[455:470, 300:340] = True                         # toca el asa
+    base = prod.astype(np.uint8) * 255
+    r = pp.analyze(base, None, scene([inst(prod, 0.9, "handbag")], hands=[inst(hand, 0.9, "hand")]), flat=False)
+    assert not r.ok and r.reason == "hand_occlusion", r.info
+
+
 def test_hand_in_background_is_ignored():
     hand = brect((780, 50, 890, 130))                     # mano lejos del libro
     r = pp.analyze(rect(BOOK), None, scene([inst(brect(BOOK))], hands=[inst(hand, 0.9, "hand")]), flat=True)

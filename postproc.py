@@ -442,7 +442,13 @@ def analyze(alpha: np.ndarray, rgb: Optional[np.ndarray], scene: Scene, *, flat:
     # 2) Mano que sujeta/tapa el producto: nada puede inventar lo que hay debajo.
     hands = [x for x in scene.hands if x.score >= P.hand_score]
     info["hands"] = len(hands)
-    occl = hand_occlusion(hands, union, touch_px=max(2, int(round(P.hand_touch_frac * long_side))),
+    # En una cara plana se mide contra el casco convexo del producto: las figuras impresas
+    # dejan "bahías" abiertas en la máscara de SAM 3 (medido en Hindi-Bindi: la copa y la mano
+    # dibujadas tocan el canto inferior) y una mano impresa caería medio "fuera". Una mano que
+    # sujeta el libro de verdad sale del casco. En bolsos no: la mano en el hueco del asa
+    # debe seguir contando como fuera.
+    hand_region = hull_mask(union) if flat else union
+    occl = hand_occlusion(hands, hand_region, touch_px=max(2, int(round(P.hand_touch_frac * long_side))),
                           outside_min=P.hand_outside_min)
     if occl:
         info["hand"] = occl
