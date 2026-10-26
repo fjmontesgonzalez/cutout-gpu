@@ -1,22 +1,29 @@
 # Construye la imagen, la prueba en CPU y la publica en GHCR (ghcr.io/<owner>/cutout-gpu).
 # En el repo de build vive en .github/workflows/build.yml.
+# HF_TOKEN (secreto, opcional): con él SAM 3 y RMBG-2.0 se bajan de sus repos oficiales
+# (gated); sin él, de copias públicas cuyo model.safetensors se verifica por SHA-256.
 name: build-image
 on:
   push:
-    branches: [main]
+    branches: [main, v3]
   workflow_dispatch:
+    inputs:
+      models:
+        description: "Modelos a incluir (CUTOUT_MODELS)"
+        default: "birefnet,rmbg2,ben2,sam3"
 permissions:
   contents: read
   packages: write
 concurrency:
-  group: build-image
+  group: build-image-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/cutout-gpu
+      MODELS: ${{ github.event.inputs.models || 'birefnet,rmbg2,ben2,sam3' }}
     steps:
       - name: Liberar disco
         run: |
@@ -27,28 +34,42 @@ jobs:
           docker system prune -af || true
           df -h /
       - uses: actions/checkout@v4
-      - name: Construir imagen
+      - name: Token de Hugging Face (opcional)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          docker build --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+          if [ -z "$HF_TOKEN" ]; then echo "Sin HF_TOKEN: SAM 3 y RMBG-2.0 se bajan de copias públicas verificadas por SHA-256"; fi
+      - name: Construir imagen
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build --secret id=hf_token,env=HF_TOKEN --build-arg CUTOUT_MODELS="$MODELS" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
             -t cutout:ci .
           docker images cutout:ci
-      - name: Tests de la lógica de máscara
-        run: docker run --rm -v "$PWD:/w" cutout:ci python /w/test_postproc.py
+      - name: Tests de la lógica de máscara y del contrato HTTP (modelos falsos)
+        run: |
+          docker run --rm -v "$PWD:/w" cutout:ci python /w/test_postproc.py
+          docker run --rm -v "$PWD:/w" cutout:ci python /w/test_server_fake.py
+      - name: Carga en CPU de los modelos base alternativos
+        run: docker run --rm -v "$PWD:/w" cutout:ci python /w/check_models.py rmbg2 ben2
       - name: Prueba de humo en CPU
         run: |
           TOKEN=ci-smoke-token
           HASH=$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)
-          docker run -d --name cut -p 9000:9000 -e CUTOUT_TOKEN_SHA256="$HASH" -e CUTOUT_ALLOW_DEBUG=1 cutout:ci
+          # En CPU: un solo modelo base y SAM 3 a 560 px para caber en la RAM del runner.
+          docker run -d --name cut -p 9000:9000 -e CUTOUT_TOKEN_SHA256="$HASH" -e CUTOUT_ALLOW_DEBUG=1 \
+            -e CUTOUT_BASE_MODELS=birefnet -e SAM3_IMAGE_SIZE=560 cutout:ci
           docker run --rm --network host -v "$PWD:/w" cutout:ci python /w/smoke_test.py http://127.0.0.1:9000 "$TOKEN"
       - name: Logs del servidor
         if: always()
-        run: docker logs cut 2>&1 | tail -120 || true
+        run: docker logs cut 2>&1 | tail -150 || true
       - name: Publicar en GHCR
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           TAG=$(echo "$GITHUB_SHA" | cut -c1-12)
           docker tag cutout:ci "$IMAGE:$TAG"
-          docker tag cutout:ci "$IMAGE:latest"
           docker push "$IMAGE:$TAG"
-          docker push "$IMAGE:latest"
-          echo "Imagen publicada: $IMAGE:$TAG" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ github.ref_name }}" = "main" ]; then docker tag cutout:ci "$IMAGE:latest" && docker push "$IMAGE:latest"; fi
+          echo "Imagen publicada: $IMAGE:$TAG (modelos: $MODELS)" >> "$GITHUB_STEP_SUMMARY"

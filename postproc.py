@@ -1,19 +1,29 @@
-"""Lógica de máscara del servidor de recorte (numpy + OpenCV, sin torch).
+"""Lógica de máscara del servidor de recorte v3 (numpy + OpenCV, sin torch).
 
-Separada de `server.py` para poder probarla en local sin GPU ni modelos
+Separada de `server.py` para poder probarla sin GPU ni modelos
 (`python test_postproc.py`). Todas las máscaras son arrays HxW: `alpha` uint8
 (0..255) o booleanos. Las cajas son (x1, y1, x2, y2) en píxeles de la imagen.
 
-Medidas con las mismas reglas que la auditoría del 2026-10-25 (scratchpad
-alpha/hull.py): déficit de casco = 1 - píxeles(alfa>=128) / píxeles(casco convexo),
-calculado sobre TODOS los píxeles visibles con la máscara reducida a 400 px de lado.
-Allí, portadas planas buenas <= 0,012; la contraportada mordida de Picoult 0,127;
-libros abiertos/pilas 0,2-0,4 (no convexos por naturaleza).
+Idea central (v3): dos modelos con papeles distintos.
+  * El modelo BASE (BiRefNet / RMBG-2.0 / BEN2) dibuja el borde fino del producto,
+    pero no sabe qué ES producto: mete el atril, la caja o la mano, y cuando el
+    producto llena el encuadre recorta lo impreso en vez del objeto.
+  * SAM 3 (`Scene`) sabe qué es producto y qué no: instancias de "book"/"handbag"...,
+    manos y soportes, con una puntuación de presencia. Sus bordes son bastos.
+`analyze()` cruza los dos: rechaza lo que no tiene arreglo (producto cortado por
+el encuadre, mano que lo tapa, nada de producto) y arregla lo que sí (fondo/atril
+fuera del producto, huecos y zonas translúcidas en una cara plana, mordiscos que
+SAM 3 sí ve enteros), refinando los bordes añadidos con un filtro guiado por el RGB.
+
+Medidas heredadas de la auditoría del 2026-10-25 (déficit de casco convexo =
+1 - área(alfa>=128) / área(casco), con la máscara a 400 px de lado): portadas
+planas buenas <= 0,012; contraportada mordida de Picoult 0,127; pulgar borrado
+0,048; libros abiertos/pilas 0,2-0,4 (no convexos por naturaleza).
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -52,6 +62,8 @@ def _downscale(mask: np.ndarray, side: int) -> np.ndarray:
 # --------------------------------------------------------------------------- métricas
 def hull_deficit(alpha: np.ndarray, *, thr: int = SOLID, side: int = 400) -> float:
     """1 - área(alfa>=thr) / área(casco convexo). 0 = forma convexa sin huecos."""
+    if alpha.dtype == bool:
+        alpha = alpha.astype(np.uint8) * 255
     small = _downscale(alpha.astype(np.uint8), side)
     m = small >= thr
     ys, xs = np.nonzero(m)
@@ -92,305 +104,478 @@ def significant_components(alpha: np.ndarray, *, thr: int = VISIBLE, side: int =
     return out
 
 
-def solid_bbox(alpha: np.ndarray, thr: int = SOLID) -> Optional[Box]:
-    ys, xs = np.nonzero(alpha >= thr)
+def mask_bbox(mask: np.ndarray) -> Optional[Box]:
+    ys, xs = np.nonzero(mask)
     if len(xs) == 0:
         return None
     return float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)
 
 
-def expand_box(box: Box, frac: float, w: int, h: int, min_px: float = 0.0) -> Box:
-    x1, y1, x2, y2 = box
-    m = max(min_px, frac * max(x2 - x1, y2 - y1))
-    return max(0.0, x1 - m), max(0.0, y1 - m), min(float(w), x2 + m), min(float(h), y2 + m)
+# --------------------------------------------------------------------------- morfología
+def _kernel(px: int) -> np.ndarray:
+    px = max(1, int(px))
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * px + 1, 2 * px + 1))
 
 
-def union_box(a: Box, b: Box) -> Box:
-    return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
+def dilate(mask: np.ndarray, px: int) -> np.ndarray:
+    if px <= 0:
+        return mask.astype(bool)
+    return cv2.dilate(mask.astype(np.uint8), _kernel(px)).astype(bool)
 
 
-def box_iou(a: Box, b: Box) -> float:
-    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
-    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
-    inter = ix * iy
-    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
-    return inter / ua if ua > 0 else 0.0
+def erode(mask: np.ndarray, px: int) -> np.ndarray:
+    if px <= 0:
+        return mask.astype(bool)
+    return cv2.erode(mask.astype(np.uint8), _kernel(px)).astype(bool)
 
 
-def _box_slices(box: Box, w: int, h: int) -> Tuple[slice, slice]:
-    x1 = int(max(0, math.floor(box[0]))); y1 = int(max(0, math.floor(box[1])))
-    x2 = int(min(w, math.ceil(box[2]))); y2 = int(min(h, math.ceil(box[3])))
-    return slice(y1, max(y1, y2)), slice(x1, max(x1, x2))
+def hull_mask(mask: np.ndarray) -> np.ndarray:
+    """Casco convexo (relleno) de una máscara booleana, a resolución completa."""
+    m = mask.astype(np.uint8)
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    pts = [c.reshape(-1, 2) for c in contours if len(c) > 0]
+    if not pts:
+        return np.zeros(mask.shape, bool)
+    hull = cv2.convexHull(np.concatenate(pts).astype(np.int32))
+    canvas = np.zeros(mask.shape, np.uint8)
+    cv2.fillConvexPoly(canvas, hull, 1)
+    return canvas.astype(bool)
 
 
-def region_from_boxes(boxes: Sequence[Box], w: int, h: int) -> np.ndarray:
-    region = np.zeros((h, w), bool)
-    for b in boxes:
-        sy, sx = _box_slices(b, w, h)
-        region[sy, sx] = True
-    return region
+def fill_holes(mask: np.ndarray) -> np.ndarray:
+    """Rellena los huecos cerrados de una máscara booleana (lo no conectado al borde)."""
+    m = mask.astype(np.uint8)
+    h, w = m.shape
+    padded = np.zeros((h + 2, w + 2), np.uint8)
+    padded[1:-1, 1:-1] = m
+    flood = padded.copy()
+    ff_mask = np.zeros((h + 4, w + 4), np.uint8)
+    cv2.floodFill(flood, ff_mask, (0, 0), 1)
+    holes = (flood == 0)[1:-1, 1:-1]
+    return mask.astype(bool) | holes
 
 
-# --------------------------------------------------------------------------- decisiones
+def drop_components(mask: np.ndarray, keep_touching: np.ndarray) -> Tuple[np.ndarray, int]:
+    """Quita los trozos 8-conexos de `mask` que no tocan `keep_touching`."""
+    n, labels, _stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if n <= 2:
+        return mask.astype(bool), 0
+    touching = np.unique(labels[keep_touching & mask.astype(bool)])
+    keep = np.isin(labels, touching[touching > 0])
+    dropped = int(n - 1 - len(touching[touching > 0]))
+    return keep & mask.astype(bool), dropped
+
+
+# --------------------------------------------------------------------------- filtro guiado
+def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int = 4, eps: float = 1e-3) -> np.ndarray:
+    """Filtro guiado (He et al.) con box filters de OpenCV. `guide` y `src` float32 en 0..1."""
+    k = (2 * radius + 1, 2 * radius + 1)
+    mean_i = cv2.boxFilter(guide, cv2.CV_32F, k)
+    mean_p = cv2.boxFilter(src, cv2.CV_32F, k)
+    corr_i = cv2.boxFilter(guide * guide, cv2.CV_32F, k)
+    corr_ip = cv2.boxFilter(guide * src, cv2.CV_32F, k)
+    var_i = corr_i - mean_i * mean_i
+    cov_ip = corr_ip - mean_i * mean_p
+    a = cov_ip / (var_i + eps)
+    b = mean_p - a * mean_i
+    return cv2.boxFilter(a, cv2.CV_32F, k) * guide + cv2.boxFilter(b, cv2.CV_32F, k)
+
+
+def refine_band(alpha: np.ndarray, rgb: Optional[np.ndarray], region: np.ndarray, *,
+                radius: int = 16, eps: float = 1e-4, clamp: Tuple[float, float] = (0.3, 0.7)) -> np.ndarray:
+    """Alinea con el RGB el borde exterior de `region` (píxeles añadidos desde SAM 3).
+
+    SAM 3 devuelve máscaras a baja resolución (escalones al ampliarlas); el filtro
+    guiado por la luminancia mueve ese borde al borde real del objeto. Medido en
+    sintético: con radio ~1/100 del lado largo (16 px a 1500) y recorte 0,3-0,7
+    desaparecen dientes de 20 px; con radio 4 apenas cambian. Sólo se toca la banda
+    alrededor del contorno exterior; el interior y el alfa del modelo base quedan intactos.
+    """
+    if rgb is None or not region.any():
+        return alpha
+    solid = alpha >= SOLID
+    band = dilate(region, radius) & ~erode(solid, radius)
+    if not band.any():
+        return alpha
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    src = alpha.astype(np.float32) / 255.0
+    q = guided_filter(gray, src, radius, eps)
+    lo, hi = clamp
+    q = np.clip((q - lo) / max(1e-6, hi - lo), 0.0, 1.0)
+    out = alpha.copy()
+    out[band] = np.round(q[band] * 255.0).astype(np.uint8)
+    return out
+
+
+def _lab(rgb: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab[..., 0] *= 100.0 / 255.0
+    lab[..., 1:] -= 128.0
+    return lab
+
+
+def color_snap(alpha: np.ndarray, rgb: Optional[np.ndarray], ring: np.ndarray, interior: np.ndarray,
+               outside: np.ndarray, *, radius: int, delta_e: float = 18.0, margin: float = 6.0) -> np.ndarray:
+    """Dentro del anillo de tolerancia alrededor del producto SAM 3, quita lo que no es del
+    mismo color que el producto adyacente y sí del color de lo que hay fuera (la repisa
+    o peana de un atril, la base de metacrilato, una franja de mesa).
+
+    El filtro guiado no sirve aquí (medido: deja la repisa casi entera, porque dentro de
+    la ventana hay tres poblaciones y el modelo lineal no las separa); comparar colores
+    Lab locales sí: el canto real del libro es continuo con la portada; la repisa no.
+    """
+    if rgb is None or not ring.any():
+        return alpha
+    lab = _lab(rgb)
+    k = (2 * radius + 1, 2 * radius + 1)
+
+    def local_mean(mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        m = mask.astype(np.float32)
+        num = cv2.boxFilter(lab * m[..., None], cv2.CV_32F, k)
+        den = cv2.boxFilter(m, cv2.CV_32F, k)
+        return num / np.maximum(den, 1e-6)[..., None], den
+
+    ref_in, den_in = local_mean(interior)
+    ref_out, den_out = local_mean(outside)
+    d_in = np.linalg.norm(lab - ref_in, axis=2)
+    d_out = np.linalg.norm(lab - ref_out, axis=2)
+    tiny = 1e-4
+    foreign = ring & (den_in > tiny) & (d_in > delta_e) & ((den_out <= tiny) | (d_in > d_out + margin))
+    if not foreign.any():
+        return alpha
+    out = alpha.copy()
+    out[foreign] = 0
+    return out
+
+
+# --------------------------------------------------------------------------- escena SAM 3
 @dataclass
-class Detection:
+class Instance:
+    mask: np.ndarray            # bool HxW
     score: float
-    box: Box
     label: str = ""
 
+    @property
+    def area(self) -> int:
+        return int(self.mask.sum())
+
+    @property
+    def box(self) -> Optional[Box]:
+        return mask_bbox(self.mask)
+
 
 @dataclass
-class BoxPlan:
-    main: Optional[Detection] = None
-    keep: List[Detection] = field(default_factory=list)
-    info: Dict[str, object] = field(default_factory=dict)
+class Scene:
+    """Lo que SAM 3 ve en la foto: instancias del producto, manos y soportes."""
+    products: List[Instance] = field(default_factory=list)
+    hands: List[Instance] = field(default_factory=list)
+    supports: List[Instance] = field(default_factory=list)
 
 
-def choose_boxes(alpha: np.ndarray, detections: Sequence[Detection], *,
-                 min_score: float = 0.30, min_fill: float = 0.45) -> BoxPlan:
-    """Cajas del detector que corresponden al producto que ve BiRefNet.
+@dataclass
+class Params:
+    """Umbrales de `analyze`; cualquiera se puede cambiar por categoría sin tocar código."""
+    product_score: float = 0.5        # puntuación mínima (clasificación x presencia) de una instancia de producto
+    hand_score: float = 0.4
+    support_score: float = 0.4
+    match_overlap: float = 0.25       # solape mínimo instancia<->máscara base para "ser el mismo producto"
+    frame_margin_frac: float = 0.006  # banda de borde que cuenta como contacto (mín. 2 px)
+    bottom_contact_max: float = 0.10  # anchura de contacto inferior tolerada (fracción del ancho del producto)
+    hand_outside_min: float = 0.30    # parte de la mano fuera del producto para ser oclusión (no una mano impresa)
+    hand_touch_frac: float = 0.01
+    mismatch_cover_min: float = 0.50  # si menos de esto de la máscara base es producto, no nos fiamos
+    rescue_fill_max: float = 0.60     # base cubre menos de esto del producto => recortó lo impreso: rescate
+    clip_dilate_frac: float = 0.012   # margen alrededor del producto SAM 3 que se respeta del borde base
+    support_dilate_frac: float = 0.002
+    outside_component_min: float = 0.01   # no planos: sólo se quitan trozos ajenos >= 1 % del área base
+    snap_delta_e: float = 18.0        # planos: color del anillo distinto del producto => ajeno (repisa, peana)
+    snap_margin: float = 6.0
+    solidify_erode_frac: float = 0.015
+    solidify_max_deficit: float = 0.08
+    bite_deficit: float = 0.035
+    sam_convex_deficit: float = 0.03
+    recover_part_max_frac: float = 0.03   # no planos: trozos de producto que SAM 3 ve y la base no (herrajes)
+    refine_radius_frac: float = 0.01  # radio del filtro guiado (fracción del lado largo, mín. 8 px)
+    guided_eps: float = 1e-4
 
-    Se quedan las cajas con puntuación suficiente cuyo interior esté ocupado por la
-    máscara (fill >= min_fill). La principal es la que contiene más máscara.
+    @classmethod
+    def from_dict(cls, conf: Optional[Dict[str, object]]) -> "Params":
+        p = cls()
+        if not conf:
+            return p
+        names = {f.name for f in fields(cls)}
+        for k, v in conf.items():
+            if k not in names:
+                continue
+            current = getattr(p, k)
+            try:
+                setattr(p, k, int(v) if isinstance(current, int) else float(v))
+            except (TypeError, ValueError):
+                pass
+        return p
+
+
+@dataclass
+class Result:
+    alpha: np.ndarray
+    ok: bool
+    reason: str
+    info: Dict[str, object]
+
+
+# --------------------------------------------------------------------------- piezas
+def frame_contact(mask: np.ndarray, margin_px: int) -> Dict[str, object]:
+    """Qué bordes de la imagen toca la máscara y qué anchura tiene el contacto inferior."""
+    h, w = mask.shape
+    m = max(1, int(margin_px))
+    sides = []
+    if mask[:m, :].any():
+        sides.append("top")
+    if mask[-m:, :].any():
+        sides.append("bottom")
+    if mask[:, :m].any():
+        sides.append("left")
+    if mask[:, -m:].any():
+        sides.append("right")
+    bottom_span = 0.0
+    if "bottom" in sides:
+        bb = mask_bbox(mask)
+        width = max(1.0, bb[2] - bb[0]) if bb else float(w)
+        bottom_span = float(mask[-m:, :].any(axis=0).sum()) / width
+    return {"sides": sides, "bottom_span": round(bottom_span, 3)}
+
+
+def match_products(base_solid: np.ndarray, products: Sequence[Instance], *,
+                   min_overlap: float = 0.25) -> List[Instance]:
+    """Instancias de producto que se solapan con lo que vio el modelo base."""
+    base_area = float(base_solid.sum())
+    out = []
+    for p in products:
+        area = float(p.mask.sum())
+        if area <= 0:
+            continue
+        inter = float((p.mask & base_solid).sum())
+        if inter / area >= min_overlap or (base_area > 0 and inter / base_area >= min_overlap):
+            out.append(p)
+    return out
+
+
+def hand_occlusion(hands: Sequence[Instance], union: np.ndarray, *, touch_px: int,
+                   outside_min: float) -> Optional[Dict[str, object]]:
+    """Una mano que TOCA el producto y queda en buena parte fuera de él lo está sujetando
+    (oclusión real). Una mano impresa en la portada queda dentro y se ignora."""
+    near = dilate(union, touch_px)
+    for hnd in hands:
+        area = float(hnd.mask.sum())
+        if area <= 0:
+            continue
+        inside = float((hnd.mask & near).sum())
+        if inside <= 0:
+            continue                       # no toca el producto: mano en el fondo
+        outside = 1.0 - inside / area
+        if outside >= outside_min:
+            return {"score": round(hnd.score, 3), "outside": round(outside, 3)}
+    return None
+
+
+def union_of(instances: Sequence[Instance], shape: Tuple[int, int]) -> np.ndarray:
+    u = np.zeros(shape, bool)
+    for inst in instances:
+        u |= inst.mask
+    return u
+
+
+# --------------------------------------------------------------------------- análisis
+def _reject(alpha: np.ndarray, reason: str, info: Dict[str, object]) -> Result:
+    info["verdict"] = "reject"
+    info["reason"] = reason
+    return Result(alpha, False, reason, info)
+
+
+def analyze(alpha: np.ndarray, rgb: Optional[np.ndarray], scene: Scene, *, flat: bool,
+            kind: Optional[str] = None, params: Optional[Params] = None) -> Result:
+    """Cruza la máscara base con la escena de SAM 3 y decide: alfa final + veredicto.
+
+    `flat` = categoría de cara plana (libros): activa el relleno de huecos, la
+    solidificación del interior y la regla de mordisco. `kind` es la clase que da el
+    core (cara_plana / objeto_sobre_fondo) y sólo se usa para desempatar el caso
+    ambiguo "ni la base ni SAM 3 ven una forma convexa" (libro abierto vs. mordido).
     """
+    P = params or Params()
+    info: Dict[str, object] = {}
     h, w = alpha.shape
-    solid = alpha >= SOLID
-    total = float(solid.sum())
-    plan = BoxPlan()
-    if total <= 0:
-        plan.info["reason"] = "empty_mask"
-        return plan
-    best = -1.0
-    for det in detections:
-        if det.score < min_score:
-            continue
-        sy, sx = _box_slices(det.box, w, h)
-        sub = solid[sy, sx]
-        if sub.size == 0:
-            continue
-        fill = float(sub.mean())
-        inside = float(sub.sum()) / total
-        if fill < min_fill:
-            continue
-        plan.keep.append(det)
-        if inside > best:
-            best = inside
-            plan.main = det
-    plan.info["candidates"] = len(detections)
-    plan.info["kept"] = len(plan.keep)
-    return plan
+    long_side = max(w, h)
+    base_solid = alpha >= SOLID
+    base_area = float(base_solid.sum())
+    if base_area < 0.002 * h * w:
+        return _reject(alpha, "empty_mask", info)
 
+    products = [p for p in scene.products if p.score >= P.product_score]
+    info["products"] = len(products)
+    info["product_score"] = round(max((p.score for p in scene.products), default=0.0), 3)
+    if not products:
+        return _reject(alpha, "no_product", info)
+    matched = match_products(base_solid, products, min_overlap=P.match_overlap)
+    info["matched"] = len(matched)
+    if not matched:
+        return _reject(alpha, "product_mismatch", info)
+    union = union_of(matched, (h, w))
+    union_area = float(union.sum())
 
-def clip_outside(alpha: np.ndarray, plan: BoxPlan, *, margin: float = 0.025,
-                 min_margin_px: float = 6.0, min_coverage: float = 0.85,
-                 min_main_score: float = 0.35) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Pone a 0 lo que BiRefNet dejó fuera de las cajas del producto (atril, mesa).
+    # 1) Producto cortado por el encuadre: no tiene arreglo.
+    fc = frame_contact(union, max(2, int(round(P.frame_margin_frac * long_side))))
+    info["frame"] = fc
+    unsafe = [s for s in fc["sides"] if s != "bottom"]
+    if unsafe:
+        return _reject(alpha, "product_cut:" + ",".join(unsafe), info)
+    if "bottom" in fc["sides"] and fc["bottom_span"] >= P.bottom_contact_max:
+        return _reject(alpha, "product_cut:bottom", info)
 
-    Sólo actúa si el detector está seguro (caja principal >= min_main_score) y si al
-    menos `min_coverage` de la máscara cae dentro: si la caja deja fuera más que eso,
-    es más probable que la caja esté mal que la máscara, y no se toca nada.
-    """
-    info: Dict[str, object] = {"clipped": False}
-    if plan.main is None or plan.main.score < min_main_score or not plan.keep:
-        info["reason"] = "no_confident_box"
-        return alpha, info
-    h, w = alpha.shape
-    boxes = [expand_box(d.box, margin, w, h, min_margin_px) for d in plan.keep]
-    region = region_from_boxes(boxes, w, h)
-    solid = alpha >= SOLID
-    total = float(solid.sum())
-    if total <= 0:
-        info["reason"] = "empty_mask"
-        return alpha, info
-    coverage = float((solid & region).sum()) / total
-    info["coverage"] = round(coverage, 4)
-    if coverage >= 0.999:
-        info["reason"] = "nothing_outside"
-        return alpha, info
-    if coverage < min_coverage:
-        info["reason"] = "box_disagrees"
-        return alpha, info
+    # 2) Mano que sujeta/tapa el producto: nada puede inventar lo que hay debajo.
+    hands = [x for x in scene.hands if x.score >= P.hand_score]
+    info["hands"] = len(hands)
+    occl = hand_occlusion(hands, union, touch_px=max(2, int(round(P.hand_touch_frac * long_side))),
+                          outside_min=P.hand_outside_min)
+    if occl:
+        info["hand"] = occl
+        return _reject(alpha, "hand_occlusion", info)
+
+    # 3) Fusión base <-> producto.
+    inter = float((base_solid & union).sum())
+    cover = inter / base_area                 # cuánta máscara base es producto
+    fill = inter / max(1.0, union_area)       # cuánto producto cubre la base
+    info["cover"] = round(cover, 3)
+    info["fill"] = round(fill, 3)
+    if cover < P.mismatch_cover_min:
+        return _reject(alpha, "product_mismatch", info)
+
     out = alpha.copy()
-    out[~region] = 0
-    info["clipped"] = True
-    info["removed"] = round(1.0 - coverage, 4)
-    return out, info
+    added = np.zeros((h, w), bool)
+    if fill < P.rescue_fill_max:
+        # La base recortó lo impreso (ilustración, título): el producto es lo que ve SAM 3.
+        add = union & ~base_solid
+        out[add] = 255
+        added |= add
+        info["rescued"] = round(1.0 - fill, 3)
 
+    r_out = max(2, int(round(P.clip_dilate_frac * long_side)))
+    sam_region = hull_mask(union) if flat else union
+    keep_region = dilate(sam_region, r_out)
+    visible = out >= VISIBLE
+    outside = visible & ~keep_region
+    if outside.any():
+        if flat:
+            out[outside] = 0
+            info["clipped"] = round(float(outside.sum()) / base_area, 4)
+        else:
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(outside.astype(np.uint8), connectivity=8)
+            removed = np.zeros((h, w), bool)
+            for i in range(1, n):
+                if stats[i, cv2.CC_STAT_AREA] >= P.outside_component_min * base_area:
+                    removed |= labels == i
+            if removed.any():
+                out[removed] = 0
+                info["clipped"] = round(float(removed.sum()) / base_area, 4)
 
-def needs_rescue(alpha: np.ndarray, *, kind: Optional[str] = None,
-                 deficit_trigger: float = 0.035, max_components: int = 2) -> Tuple[bool, Dict[str, object]]:
-    """¿La máscara parece mordida o despiezada?
+    supports = [s for s in scene.supports if s.score >= P.support_score]
+    info["supports"] = len(supports)
+    if supports:
+        r_small = max(1, int(round(P.support_dilate_frac * long_side)))
+        near = dilate(union, r_small)
+        region = union_of(supports, (h, w)) & ~near & (out >= VISIBLE)
+        if region.any():
+            out[region] = 0
+            info["support_removed"] = round(float(region.sum()) / base_area, 4)
 
-    - Déficit de casco > trigger (sólo si el producto puede ser una cara plana).
-    - Más de `max_components` trozos significativos: es la señal con la que el core
-      descarta la foto (`foreground_fragmented`); el rescate puede salvarla.
-    """
-    deficit = hull_deficit(alpha)
-    comps = len(significant_components(alpha))
-    info: Dict[str, object] = {"deficit": deficit, "components": comps}
-    reasons = []
-    if kind != "objeto_sobre_fondo" and deficit > deficit_trigger:
-        reasons.append("deficit")
-    if comps > max_components:
-        reasons.append("fragmented")
-    info["reasons"] = reasons
-    return bool(reasons), info
+    if flat:
+        # Anillo de tolerancia: lo que la base conserva pegado al producto pero fuera del
+        # contorno de SAM 3. Si su color no es el del producto adyacente, es ajeno.
+        ring = keep_region & ~sam_region & (out >= VISIBLE)
+        if ring.any():
+            before = int(ring.sum())
+            out = color_snap(out, rgb, ring, erode(union, 2) & (out >= SOLID), ~keep_region,
+                             radius=3 * r_out, delta_e=P.snap_delta_e, margin=P.snap_margin)
+            snapped = before - int((ring & (out >= VISIBLE)).sum())
+            if snapped > 0:
+                info["snapped"] = round(float(snapped) / base_area, 4)
 
+    # Trozos sueltos que no tocan el producto (restos de caja, sombras lejanas).
+    vis = out >= VISIBLE
+    kept, dropped = drop_components(vis, dilate(union, r_out))
+    if dropped:
+        out[vis & ~kept] = 0
+        info["dropped_components"] = dropped
 
-def undersegmented_box(alpha: np.ndarray, detections: Sequence[Detection], *,
-                       min_score: float = 0.35, max_fill: float = 0.6,
-                       min_inside: float = 0.9) -> Tuple[Optional[Detection], Dict[str, object]]:
-    """Caja de libro segura que la máscara sólo cubre en parte.
-
-    Es la firma de "recortó lo impreso, no el libro": la máscara (la ilustración, el
-    título) cae casi entera dentro de la caja del libro (inside >= 0,9) pero llena menos
-    del 60 % de ella. Medido el 2026-10-26 en "Hindi-Bindi" (sólo las dos mujeres) y en
-    "Radar afloat" (sólo el aparato), que el core daba por publicables.
-    Se leen las detecciones crudas: el filtro de `choose_boxes` descarta justo estas cajas.
-    """
-    h, w = alpha.shape
-    solid = alpha >= SOLID
-    total = float(solid.sum())
-    if total <= 0:
-        return None, {"reason": "empty_mask"}
-    best = None
-    for det in detections:
-        if det.score < min_score:
-            continue
-        sy, sx = _box_slices(det.box, w, h)
-        sub = solid[sy, sx]
-        if sub.size == 0:
-            continue
-        fill = float(sub.mean())
-        inside = float(sub.sum()) / total
-        if fill < max_fill and inside >= min_inside and (best is None or det.score > best[0].score):
-            best = (det, fill, inside)
-    if best is None:
-        return None, {"reason": "no_candidate"}
-    det, fill, inside = best
-    return det, {"fill": round(fill, 3), "inside": round(inside, 3), "score": round(det.score, 2)}
-
-
-def merge_box_rescue(alpha: np.ndarray, sam_mask: np.ndarray, box: Box, *,
-                     sam_max_deficit: float = 0.03, min_box_fill: float = 0.75,
-                     min_cover: float = 0.9, box_margin: float = 0.03, erode_px: int = 2,
-                     feather_sigma: float = 0.8) -> Tuple[Optional[np.ndarray], Dict[str, object]]:
-    """Sustituye una máscara de "sólo lo impreso" por el libro entero que ve SAM en la caja.
-
-    Aquí la prueba es la caja del detector, no el casco de BiRefNet (que sólo rodea la
-    ilustración). Por eso las tres reglas son estrictas:
-    1. SAM ve una cara plana: déficit <= sam_max_deficit.
-    2. SAM llena la caja del libro (>= min_box_fill): segmentó el objeto que detectó DINO.
-    3. SAM contiene lo que ya vio BiRefNet (>= min_cover): es el mismo producto.
-    Límite conocido: libro crema sobre mesa crema alineado con la caja; SAM podría rellenar
-    la caja con mesa y pasar las tres reglas. Lo para la guarda de material ajeno del core.
-    """
-    h, w = alpha.shape
-    info: Dict[str, object] = {}
-    sam = sam_mask.astype(bool)
-    sy, sx = _box_slices(expand_box(box, box_margin, w, h, 4.0), w, h)
-    inbox = np.zeros_like(sam)
-    inbox[sy, sx] = True
-    sam &= inbox
-    solid = alpha >= SOLID
-    d_sam = hull_deficit(sam.astype(np.uint8) * 255)
+    single_flat = flat and len(matched) == 1 and kind != "objeto_sobre_fondo"
+    d_sam = hull_deficit(union)
     info["sam_deficit"] = d_sam
-    if d_sam > sam_max_deficit:
-        info["reject"] = "sam_not_convex"
-        return None, info
-    by, bx = _box_slices(box, w, h)
-    box_fill = float(sam[by, bx].mean()) if sam[by, bx].size else 0.0
-    info["sam_box_fill"] = round(box_fill, 3)
-    if box_fill < min_box_fill:
-        info["reject"] = "sam_not_filling_box"
-        return None, info
-    cover = float((sam & solid).sum()) / max(1.0, float(solid.sum()))
-    info["sam_cover"] = round(cover, 3)
-    if cover < min_cover:
-        info["reject"] = "sam_misses_mask"
-        return None, info
-    add = sam
-    if erode_px > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1, 2 * erode_px + 1))
-        add = cv2.erode(add.astype(np.uint8), k).astype(bool)
-    soft = add.astype(np.float32) * 255.0
-    if feather_sigma > 0:
-        soft = cv2.GaussianBlur(soft, (0, 0), feather_sigma)
-    merged = np.maximum(alpha, np.clip(soft, 0, 255).astype(np.uint8))
-    info["added"] = round(float((merged >= SOLID).sum() - solid.sum()) / max(1.0, float(solid.sum())), 4)
-    return merged, info
+    if single_flat:
+        # 4) Integridad de la cara plana: un libro es opaco y no tiene agujeros.
+        vis = out >= VISIBLE
+        filled = fill_holes(vis)
+        holes = filled & ~vis
+        if holes.any():
+            out[holes] = 255
+            added |= holes
+            info["holes_filled"] = round(float(holes.sum()) / base_area, 4)
+        d_now = hull_deficit(out)
+        if d_now <= P.solidify_max_deficit:
+            k = max(2, int(round(P.solidify_erode_frac * long_side)))
+            core = erode(hull_mask(out >= SOLID), k) & dilate(union, max(1, k // 3))
+            soft = core & (out < 255)
+            if soft.any():
+                info["solidified"] = round(float(soft.sum()) / base_area, 4)
+                out[soft] = 255
+        d_now = hull_deficit(out)
+        if d_now > P.bite_deficit and d_sam <= P.sam_convex_deficit:
+            # SAM 3 ve la cara entera y la base la dejó mordida: se rellena lo que falta.
+            fillr = union & ~(out >= SOLID)
+            if fillr.any():
+                out[fillr] = 255
+                added |= fillr
+                info["bite_filled"] = round(float(fillr.sum()) / base_area, 4)
+                d_now = hull_deficit(out)
+        info["deficit"] = d_now
+        if d_now > P.bite_deficit:
+            if d_sam > P.sam_convex_deficit and kind != "cara_plana":
+                # Ni la base ni SAM 3 ven una forma convexa y el core no asegura que sea una
+                # portada: puede ser un libro abierto. Se acepta y se deja constancia.
+                info["nonconvex_accepted"] = True
+            else:
+                return _reject(out, "bitten", info)
+    else:
+        info["deficit"] = hull_deficit(out)
+        if not flat and P.recover_part_max_frac > 0:
+            # Herrajes y detalles pequeños que SAM 3 ve como producto y la base perdió.
+            missing = union & ~(out >= VISIBLE)
+            if missing.any():
+                n, labels, stats, _ = cv2.connectedComponentsWithStats(missing.astype(np.uint8), connectivity=8)
+                near = dilate(out >= SOLID, 3)
+                recovered = np.zeros((h, w), bool)
+                for i in range(1, n):
+                    part = labels == i
+                    if stats[i, cv2.CC_STAT_AREA] <= P.recover_part_max_frac * union_area and (part & near).any():
+                        recovered |= part
+                if recovered.any():
+                    out[recovered] = 255
+                    added |= recovered
+                    info["recovered_parts"] = round(float(recovered.sum()) / base_area, 4)
+
+    if added.any():
+        radius = max(8, int(round(P.refine_radius_frac * long_side)))
+        out = refine_band(out, rgb, added, radius=radius, eps=P.guided_eps)
+        info["added"] = round(float(added.sum()) / base_area, 4)
+
+    info["components"] = len(significant_components(out))
+    info["verdict"] = "ok"
+    info["reason"] = "ok"
+    return Result(out, True, "ok", info)
 
 
-def rescue_box(alpha: np.ndarray, main: Optional[Detection], *, pad: float = 0.01) -> Optional[Box]:
-    """Caja para SAM: la de la máscara (todos los trozos), unida a la del detector si coinciden."""
-    h, w = alpha.shape
-    mb = solid_bbox(alpha, VISIBLE)
-    if mb is None:
-        return main.box if main is not None else None
-    box = mb
-    if main is not None and box_iou(mb, main.box) >= 0.5:
-        box = union_box(mb, main.box)
-    return expand_box(box, pad, w, h, 2.0)
-
-
-def merge_rescue(alpha: np.ndarray, sam_mask: np.ndarray, box: Box, *,
-                 sam_max_deficit: float = 0.03, hull_dilate: float = 0.01,
-                 erode_px: int = 2, feather_sigma: float = 0.8,
-                 min_gain: float = 0.01) -> Tuple[Optional[np.ndarray], Dict[str, object]]:
-    """Rellena con la máscara de SAM sólo lo que falta DENTRO del casco del producto.
-
-    Reglas, todas necesarias:
-    1. La máscara de SAM es convexa (déficit <= sam_max_deficit): ve una cara plana.
-       Un libro abierto, una pila o un jarrón la tumban, y se queda BiRefNet.
-    2. Sólo se añade dentro del casco convexo de lo que BiRefNet ya vio (todos sus
-       trozos), dilatado un 1 %: nunca se añaden esquinas de mesa fuera del producto.
-    3. El resultado mejora de verdad: menos déficit o menos trozos.
-    Los píxeles RGB no se tocan; sólo cambia el alfa.
-    """
-    h, w = alpha.shape
-    info: Dict[str, object] = {}
-    sam = sam_mask.astype(bool)
-    sy, sx = _box_slices(expand_box(box, 0.01, w, h, 2.0), w, h)
-    inbox = np.zeros_like(sam)
-    inbox[sy, sx] = True
-    sam &= inbox
-    solid = alpha >= SOLID
-    if sam.sum() < 0.5 * max(1, solid.sum()):
-        info["reject"] = "sam_small"
-        return None, info
-    d_sam = hull_deficit(sam.astype(np.uint8) * 255)
-    info["sam_deficit"] = d_sam
-    if d_sam > sam_max_deficit:
-        info["reject"] = "sam_not_convex"
-        return None, info
-
-    visible = alpha >= VISIBLE
-    ys, xs = np.nonzero(visible)
-    if len(xs) < 10:
-        info["reject"] = "empty_mask"
-        return None, info
-    hull = cv2.convexHull(np.column_stack([xs, ys]).astype(np.int32))
-    allowed = np.zeros((h, w), np.uint8)
-    cv2.fillConvexPoly(allowed, hull, 1)
-    grow = max(1, int(round(hull_dilate * math.hypot(w, h))))
-    allowed = cv2.dilate(allowed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)))
-    add = sam & allowed.astype(bool)
-    if erode_px > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1, 2 * erode_px + 1))
-        add = cv2.erode(add.astype(np.uint8), k).astype(bool)
-    soft = add.astype(np.float32) * 255.0
-    if feather_sigma > 0:
-        soft = cv2.GaussianBlur(soft, (0, 0), feather_sigma)
-    merged = np.maximum(alpha, np.clip(soft, 0, 255).astype(np.uint8))
-
-    d_before = hull_deficit(alpha)
-    c_before = len(significant_components(alpha))
-    d_after = hull_deficit(merged)
-    c_after = len(significant_components(merged))
-    info.update({"deficit_before": d_before, "deficit_after": d_after,
-                 "components_before": c_before, "components_after": c_after,
-                 "added": round(float((merged >= SOLID).sum() - solid.sum()) / max(1.0, float(solid.sum())), 4)})
-    if d_after <= d_before - min_gain or c_after < c_before:
-        return merged, info
-    info["reject"] = "no_gain"
-    return None, info
+__all__ = [
+    "SOLID", "VISIBLE", "Box", "Instance", "Scene", "Params", "Result",
+    "work_size", "hull_deficit", "significant_components", "mask_bbox",
+    "dilate", "erode", "hull_mask", "fill_holes", "drop_components",
+    "guided_filter", "refine_band", "color_snap", "frame_contact", "match_products", "hand_occlusion",
+    "union_of", "analyze",
+]
