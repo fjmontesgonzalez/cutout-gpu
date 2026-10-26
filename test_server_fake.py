@@ -43,26 +43,38 @@ def _brect(box):
     return m
 
 
+def _book_box(shape):
+    """Caja del libro falso en proporción a la foto (900x1200 -> 150,150,750,1050)."""
+    h, w = shape[:2]
+    return int(w * 0.1667), int(h * 0.125), int(w * 0.8333), int(h * 0.875)
+
+
 def fake_base(name, rgb):
     seen.setdefault("bases", []).append(name)
-    a = np.zeros(rgb.shape[:2], np.uint8)
-    a[150:1050, 150:750] = 255
+    h, w = rgb.shape[:2]
+    x1, y1, x2, y2 = _book_box(rgb.shape)
+    a = np.zeros((h, w), np.uint8)
+    a[y1:y2, x1:x2] = 255
     if name == "rmbg2":
-        a[1050:1110, 100:800] = 255          # rmbg2 "ve" también una repisa
-    return a, {"work": "{}x{}".format(*pp.work_size(rgb.shape[1], rgb.shape[0]))}
+        a[y2:int(h * 0.925), int(w * 0.111):int(w * 0.889)] = 255   # rmbg2 "ve" también una repisa
+    return a, {"work": "{}x{}".format(*pp.work_size(w, h))}
 
 
 def fake_scene(rgb, prompts, hazards):
     seen["prompts"] = list(prompts)
     seen["hazards"] = dict(hazards)
-    products = [pp.Instance(_brect(BOOK), 0.92, prompts[0])]
+    h, w = rgb.shape[:2]
+    x1, y1, x2, y2 = _book_box(rgb.shape)
+    book = np.zeros((h, w), bool)
+    book[y1:y2, x1:x2] = True
+    products = [pp.Instance(book, 0.92, prompts[0])]
     hands = []
     if seen.get("with_hand"):
-        hand = np.zeros((H, W), bool)
-        hand[560:760, 0:330] = True
+        hand = np.zeros((h, w), bool)
+        hand[int(h * 0.467):int(h * 0.633), 0:int(w * 0.367)] = True
         hands = [pp.Instance(hand, 0.8, "hand")]
     return pp.Scene(products=products, hands=hands), {"t_sam3": 0.1, "t_vision": 0.05, "dtype": "fp16",
-                                                        "instances": {prompts[0]: [{"score": 0.92, "box": list(BOOK)}]}}
+                                                        "instances": {prompts[0]: [{"score": 0.92, "box": [x1, y1, x2, y2]}]}}
 
 
 server._base_alpha = fake_base
