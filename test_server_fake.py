@@ -177,6 +177,15 @@ def test_debug_returns_all_models():
     assert sorted(seen["bases"]) == ["birefnet", "rmbg2"]
 
 
+def test_warmup_runs_with_fakes():
+    # El calentamiento usa los mismos caminos que una petición real (falló en CI por una tupla).
+    seen.clear()
+    import torch
+    server._M["torch"] = torch
+    server._warmup()
+    assert server._M.get("warmup_products") == 1 and sorted(seen["bases"]) == ["birefnet", "rmbg2"]
+
+
 def test_debug_disabled_without_flag():
     server.ALLOW_DEBUG = False
     try:

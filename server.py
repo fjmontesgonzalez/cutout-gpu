@@ -305,7 +305,7 @@ def _warmup() -> None:
         scene, sinfo = _sam3_scene(rgb, ["book"], HAZARDS)
     _M["warmup_products"] = len(scene.products)
     for name in _M["bases"]:
-        alpha = _base_alpha(name, rgb)
+        alpha, _info = _base_alpha(name, rgb)
         pp.analyze(alpha, rgb, scene, flat=True)
 
 
