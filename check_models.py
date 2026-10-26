@@ -31,6 +31,9 @@ def main() -> int:
     for name in wanted:
         spec = server.BASE_SPECS[name]
         path = os.path.join(server.MODELS_DIR, spec["dir"])
+        if not os.path.isdir(path):
+            print("{:9} ausente en {} (no va en esta imagen); se omite".format(name, server.MODELS_DIR))
+            continue
         t = time.time()
         try:
             loader = server._load_ben2 if spec["mode"] == "ben2" else server._load_birefnet
