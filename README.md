@@ -46,6 +46,7 @@ Motivos de rechazo: `no_product`, `product_mismatch`, `product_cut:<lados>`,
 | `CUTOUT_CATEGORY` | categoría por defecto (`book`). |
 | `CUTOUT_CATEGORIES` | JSON: añade categorías o cambia `prompts`, `flat` y `params` (cualquier campo de `postproc.Params`). |
 | `CUTOUT_HAZARDS` | JSON: prompts de `hand` y `support`. |
+| `CUTOUT_SAM3` | `1` (por defecto) SAM 3 decide producto/mano/soporte; `0` = **sólo recorte**: devuelve el alfa del modelo base tal cual (sustituto exacto de Bria), arranque ~40 s en vez de ~120 s. |
 | `CUTOUT_BASE_MODEL` | modelo base de producción (`birefnet`, `rmbg2`, `ben2`). |
 | `CUTOUT_BASE_MODELS` | lista de modelos base a cargar (por defecto, todos los presentes en la imagen). |
 | `SAM3_DTYPE` | `auto` (fp16 con comprobación en el calentamiento y vuelta a fp32), `fp16`, `fp32`. |

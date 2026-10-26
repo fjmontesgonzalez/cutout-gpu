@@ -520,7 +520,10 @@ def analyze(alpha: np.ndarray, rgb: Optional[np.ndarray], scene: Scene, *, flat:
         out[vis & ~kept] = 0
         info["dropped_components"] = dropped
 
-    single_flat = flat and len(matched) == 1 and kind != "objeto_sobre_fondo"
+    # La categoría manda (un libro es una cara plana aunque Qwen lo etiquete "objeto_sobre_fondo",
+    # medido el 26-10: lo hizo con libros tumbados y se perdía el relleno de huecos). `kind` sólo
+    # desempata el caso ambiguo del mordisco (abajo).
+    single_flat = flat and len(matched) == 1
     d_sam = hull_deficit(union)
     info["sam_deficit"] = d_sam
     if single_flat:

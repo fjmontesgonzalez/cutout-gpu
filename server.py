@@ -81,6 +81,10 @@ SAM3_THRESHOLD = _env_float("SAM3_THRESHOLD", 0.2)       # umbral de recogida; c
 SAM3_IMAGE_SIZE = int(_env_float("SAM3_IMAGE_SIZE", 1008))  # 1008 = nativo; menos sólo para CI en CPU
 SAM3_DTYPE = (os.environ.get("SAM3_DTYPE", "auto") or "auto").strip().lower()  # auto|fp16|fp32
 ALLOW_DEBUG = os.environ.get("CUTOUT_ALLOW_DEBUG", "") == "1"
+# CUTOUT_SAM3=0 apaga SAM 3: el servicio devuelve el alfa del modelo base tal cual (sustituto
+# exacto de Bria; el core conserva sus guardas y la guarda Qwen) y arranca en ~40 s en vez de
+# ~120 s. Con 1 (por defecto) SAM 3 decide producto/mano/soporte (postproc.analyze).
+SAM3_ENABLED = (os.environ.get("CUTOUT_SAM3", "1") or "1").strip().lower() not in ("0", "off", "false", "no")
 MAX_UPLOAD = 20 * 1024 * 1024
 
 # Modelos base disponibles (se cargan los que existan en MODELS_DIR y estén en
@@ -244,9 +248,13 @@ def load_models() -> None:
             raise RuntimeError("ningún modelo base en {} ({})".format(MODELS_DIR, sorted(BASE_SPECS)))
         default = BASE_MODEL_DEFAULT if BASE_MODEL_DEFAULT in bases else sorted(bases)[0]
         sam3_dir = os.path.join(MODELS_DIR, "sam3")
-        if not os.path.isdir(sam3_dir):
-            raise RuntimeError("falta SAM 3 en {}: el servidor v3 no funciona sin él".format(sam3_dir))
-        sam3, sam3_proc, sam3_dtype = _load_sam3(sam3_dir, device)
+        if SAM3_ENABLED:
+            if not os.path.isdir(sam3_dir):
+                raise RuntimeError("falta SAM 3 en {} (o arranca con CUTOUT_SAM3=0)".format(sam3_dir))
+            sam3, sam3_proc, sam3_dtype = _load_sam3(sam3_dir, device)
+        else:
+            sam3, sam3_proc, sam3_dtype = None, None, None
+            log.warning("CUTOUT_SAM3=0: sin SAM 3, el servicio devuelve el alfa del modelo base sin análisis")
         mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
         _M.update(torch=torch, device=device, half=half, bases=bases, base_default=default,
@@ -262,6 +270,8 @@ def load_models() -> None:
 
 
 def _sam3_dtype_name() -> str:
+    if not _M.get("sam3"):
+        return "off"
     dt = _M.get("sam3_dtype")
     return "fp16" if dt is not None and str(dt).endswith("float16") else "fp32"
 
@@ -286,6 +296,11 @@ def _warmup() -> None:
     o no ve el libro sintético que sí ve en fp32, se queda en fp32 (la T4 no tiene bf16)."""
     rgb = _synthetic_photo()
     torch = _M["torch"]
+    if not _M.get("sam3"):
+        for name in _M["bases"]:
+            _base_alpha(name, rgb)
+        _M["warmup_products"] = None
+        return
     try:
         scene, sinfo = _sam3_scene(rgb, ["book"], HAZARDS)
         finite = all(np.isfinite(p.score) for p in scene.products)
@@ -430,7 +445,10 @@ def _process(rgb: np.ndarray, *, category: Optional[str], kind: Optional[str],
     chosen = want if want in _M["bases"] else str(_M["base_default"])
     names = sorted(_M["bases"]) if all_models else [chosen]
 
-    scene, sinfo = _sam3_scene(rgb, list(conf["prompts"]), HAZARDS)
+    if _M.get("sam3"):
+        scene, sinfo = _sam3_scene(rgb, list(conf["prompts"]), HAZARDS)
+    else:
+        scene, sinfo = pp.Scene(), {"dtype": "off", "t_sam3": 0.0, "instances": {}}
     out: Dict[str, object] = {"category": cat, "kind": kind, "flat": flat, "model": chosen,
                               "sam3": sinfo, "models": {}}
     for name in names:
@@ -438,7 +456,14 @@ def _process(rgb: np.ndarray, *, category: Optional[str], kind: Optional[str],
         alpha, binfo = _base_alpha(name, rgb)
         t_base = round(time.time() - t, 3)
         t = time.time()
-        res = pp.analyze(alpha, rgb, scene, flat=flat, kind=kind, params=params)
+        if _M.get("sam3"):
+            res = pp.analyze(alpha, rgb, scene, flat=flat, kind=kind, params=params)
+        else:
+            # Modo "sólo recorte": el alfa del modelo base tal cual, veredicto ok; el core
+            # aplica sus guardas (bordes, despiece, guarda Qwen) como con Bria.
+            res = pp.Result(alpha, True, "ok", {"sam3": "off", "deficit": pp.hull_deficit(alpha),
+                                                "components": len(pp.significant_components(alpha)),
+                                                "verdict": "ok", "reason": "ok"})
         out["models"][name] = {"base_alpha": alpha, "result": res, "t_base": t_base,
                                "t_analyze": round(time.time() - t, 3), "work": binfo["work"]}
     out["scene"] = scene

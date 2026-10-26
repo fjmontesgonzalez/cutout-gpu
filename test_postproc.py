@@ -289,7 +289,16 @@ def test_open_book_with_core_kind_object_is_accepted():
     cv2.fillConvexPoly(pages, np.array([[100, 300], [450, 250], [450, 1000], [100, 900]], np.int32), 255)
     cv2.fillConvexPoly(pages, np.array([[450, 250], [800, 300], [800, 900], [450, 1000]], np.int32), 255)
     r = pp.analyze(pages, None, scene([inst(pages > 0)]), flat=True, kind="objeto_sobre_fondo")
-    assert r.ok and "nonconvex_accepted" not in r.info, r.info
+    assert r.ok, r.info
+    assert (r.alpha[600, 50] == 0) and (r.alpha[600, 850] == 0), "no se rellena fuera de las páginas"
+
+
+def test_flat_rules_apply_even_if_core_kind_says_object():
+    # Foto 57: Qwen dijo "objeto_sobre_fondo" para un libro tumbado; los huecos deben rellenarse igual.
+    base = rect(BOOK)
+    base[500:520, 400:420] = 0
+    r = pp.analyze(base, photo(), scene([inst(brect(BOOK))]), flat=True, kind="objeto_sobre_fondo")
+    assert r.ok and r.alpha[510, 410] == 255 and r.info.get("holes_filled"), r.info
 
 
 def test_bag_keeps_strap_and_drops_box_remnants():

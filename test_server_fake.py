@@ -198,6 +198,24 @@ def test_warmup_runs_with_fakes():
     assert server._M.get("warmup_products") == 1 and sorted(seen["bases"]) == ["birefnet", "rmbg2"]
 
 
+def test_sam3_off_returns_base_alpha():
+    # CUTOUT_SAM3=0: sustituto exacto de Bria: alfa base tal cual, veredicto ok, sin análisis.
+    saved = server._M.get("sam3")
+    server._M["sam3"] = None
+    seen.clear()
+    seen["with_hand"] = True                               # con SAM 3 se rechazaría; apagado, no
+    try:
+        r = post({"model": "rmbg2"})
+    finally:
+        server._M["sam3"] = saved
+        seen["with_hand"] = False
+    assert r.status_code == 200 and r.headers["x-cutout-verdict"] == "ok"
+    assert r.headers["x-cutout-sam3-dtype"] == "off"
+    a = np.asarray(Image.open(io.BytesIO(r.content)).getchannel("A"))
+    assert a[1100, 450] == 255, "sin SAM 3 la repisa NO se recorta (como Bria)"
+    assert "prompts" not in seen, "no se llama a SAM 3"
+
+
 def test_debug_disabled_without_flag():
     server.ALLOW_DEBUG = False
     try:
